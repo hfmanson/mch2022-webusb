@@ -7,6 +7,7 @@ var terminal_esp32 = null;
 var terminal_fpga = null;
 var bitstream_state = false;
 var bitstream_process_state = 0;
+var g_tab;
 
 function onStart() {
     document.getElementById("app").innerHTML = "<button type='button' id='connect'>Connect</button>";
@@ -113,6 +114,7 @@ async function resetEsp32ToWebUSB(ifIndex, webusb_mode = 0x00) {
     await new Promise(r => setTimeout(r, 50));
     await setBitstreamMode(0);
     if (webusb_mode > 0) {
+		webusb_message = undefined;
         setTimeout(async () => {
             await setBaudrate(ifIndex, 921600);
             await new Promise(r => setTimeout(r, 50));
@@ -252,16 +254,107 @@ async function uploadBitstream() {
     }
 }
 
+let webusb_message;
+
+function hexFormat(n, digits) {
+	return "0x" + ("00000000" + n.toString(16)).slice(-digits);
+}
+
+function usbData() {
+	let result = "";
+	for (let i = 12; i < webusb_message.length; i++) {
+		const ch = webusb_message[i];
+		if (ch == 0) {
+			result += "\\0";
+		}
+		else if (ch == 10) {
+			result += "\\n";
+		} else {
+			result += String.fromCharCode(ch);
+		}
+	}
+	return result;
+}
+
+function log(message) {
+	console.log(message);
+	terminal_debug.write(message + "\r\n");
+}
+
+function processWebUSB() {
+	console.log(webusb_message);
+	const
+		command =
+			webusb_message[0] |
+			webusb_message[1] << 8
+		, payload_length =
+			webusb_message[2] |
+			webusb_message[3] << 8 |
+			webusb_message[4] << 16 |
+			webusb_message[5] << 24
+		, dead =
+			webusb_message[6] |
+			webusb_message[7] << 8
+		, message_id =
+			webusb_message[8] |
+			webusb_message[9] << 8 |
+			webusb_message[10] << 16 |
+			webusb_message[11] << 24
+		;
+
+	log("command: " + hexFormat(command, 4));
+	log("payload length: " + payload_length);
+	log("verify: " + hexFormat(dead, 4));
+	log("message id: " + message_id);
+	log("data: " + usbData());
+}
+
 async function listen(ifIndex) {
     let endpoint = interfaces[ifIndex].epIn;
     console.log("Listening on ", endpoint.endpointNumber);
     while (true) {
         let result = await device.transferIn(endpoint.endpointNumber, endpoint.packetSize);
-        const decoder = new TextDecoder();
-        const message = decoder.decode(result.data);
         //console.log(endpoint.endpointNumber, ":", message);
         if (ifIndex == 0) {
-            terminal_debug.write(message);
+			switch (g_tab) {
+				case 0: {
+					const decoder = new TextDecoder();
+					const message = decoder.decode(result.data);
+					terminal_debug.write(message);
+					break;
+				}
+				case 1: {
+					break;
+				}
+				case 2: {
+					break;
+				}
+				case 3: {
+					const message = new Uint8Array(result.data.buffer);
+					if (webusb_message) {
+						const new_message = new Uint8Array(webusb_message.length + message.length);
+						new_message.set(webusb_message);
+						new_message.set(message, webusb_message.length);
+						webusb_message = new_message;
+					} else {
+						webusb_message = message;
+					}
+					if (webusb_message.length >= 12) {
+						const payload_length =
+							webusb_message[2] |
+							(webusb_message[3] << 8) |
+							(webusb_message[4] << 16) |
+							(webusb_message[5] << 24)
+							;
+
+						if (webusb_message.length === 12 + payload_length) {
+							processWebUSB();
+							webusb_message = undefined;
+						}
+					}
+					break;
+				}
+			}
         } else if (ifIndex == 1) {
             if (bitstream_state) {
                 bitstreamReceive(message);
@@ -323,11 +416,22 @@ function selectTab(select) {
     if (typeof tabs[select].onSelect === "function") {
         tabs[select].onSelect();
     }
+	g_tab = select;
 }
 
 function initTabs(newTabs) {
     tabs = newTabs;
     selectTab(0);
+}
+
+async function sendHeartBeat() {
+	const heart = new Uint8Array([  0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0xde, 0xad, 0x02, 0x00, 0x00, 0x00 ]);
+	await writeRaw(0, heart);
+}
+
+async function getFSDir() {
+	const fsdir = new Uint8Array([  0x00, 0x10, 0x01, 0x00, 0x00, 0x00, 0xde, 0xad, 0x02, 0x00, 0x00, 0x00, 0x2f ]);
+	await writeRaw(0, fsdir);
 }
 
 window.onload = () => {
